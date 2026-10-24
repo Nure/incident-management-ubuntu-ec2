@@ -1,0 +1,13 @@
+# Never commit credentials or local environment
+.env
+*.env
+!.env.example
+!.*/.env.example
+node_modules/
+dist/
+.DS_Store
+*.log
+.npm/
+.coverage/
+.idea/
+.vscode/

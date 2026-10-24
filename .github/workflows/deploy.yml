@@ -1,0 +1,86 @@
+name: Deploy Incident Management to Ubuntu EC2
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: incident-native-main
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Validate and build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install backend dependencies and verify syntax
+        working-directory: backend
+        run: |
+          if [[ -f package-lock.json ]]; then npm ci; else npm install; fi
+          npm run check
+      - name: Install frontend dependencies and build
+        working-directory: frontend
+        run: |
+          if [[ -f package-lock.json ]]; then npm ci; else npm install; fi
+          npm run build
+
+  deploy:
+    name: Deploy to pre-configured Ubuntu EC2
+    needs: build
+    runs-on: ubuntu-latest
+    # Configure variables & secrets documented in docs/GITHUB_ACTIONS.md.
+    # No credentials? Skip deploy, but CI still runs.
+    env:
+      EC2_HOST: ${{ vars.EC2_HOST }}
+      EC2_USER: ${{ vars.EC2_USER }}
+      EC2_APP_DIR: ${{ vars.EC2_APP_DIR }}
+      EC2_SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+      EC2_SSH_KNOWN_HOSTS: ${{ secrets.EC2_SSH_KNOWN_HOSTS }}
+    steps:
+      - name: Check deployment configuration
+        id: config
+        run: |
+          if [[ -z "$EC2_HOST" || -z "$EC2_USER" || -z "$EC2_APP_DIR" || -z "$EC2_SSH_PRIVATE_KEY" || -z "$EC2_SSH_KNOWN_HOSTS" ]]; then
+            echo 'enabled=false' >> "$GITHUB_OUTPUT"
+            echo 'Deployment not configured: skipping (CI succeeded).'
+          else
+            echo 'enabled=true' >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v4
+        if: steps.config.outputs.enabled == 'true'
+      - name: Prepare verified SSH credentials
+        if: steps.config.outputs.enabled == 'true'
+        run: |
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$EC2_SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$EC2_SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+      - name: Transfer source and deploy application
+        if: steps.config.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          # Only allow the documented home-directory installation target.
+          if [[ "$EC2_APP_DIR" != /home/*/incident-management-ubuntu-ec2 ]]; then
+            echo 'EC2_APP_DIR must be /home/<user>/incident-management-ubuntu-ec2' >&2
+            exit 1
+          fi
+          ssh -o StrictHostKeyChecking=yes -i "$HOME/.ssh/id_ed25519" \
+              "$EC2_USER@$EC2_HOST" "mkdir -p '$EC2_APP_DIR'"
+          rsync -az --delete \
+            --exclude '.git/' \
+            --exclude 'node_modules/' \
+            --exclude 'dist/' \
+            --exclude 'backend/.env' \
+            -e "ssh -o StrictHostKeyChecking=yes -i $HOME/.ssh/id_ed25519" \
+            ./ "$EC2_USER@$EC2_HOST:$EC2_APP_DIR/"
+          ssh -o StrictHostKeyChecking=yes -i "$HOME/.ssh/id_ed25519" \
+              "$EC2_USER@$EC2_HOST" "cd '$EC2_APP_DIR' && bash scripts/deploy-ubuntu.sh"
